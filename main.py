@@ -7,6 +7,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
+from urllib.parse import urlparse
 
 app = FastAPI()
 
@@ -40,6 +41,7 @@ ADMIN_HTML = """
     <button id="addRowBtn" class="secondary">+ 增加一行</button>
     <button id="submitBtn">提交导入</button>
     <button id="scanBtn" class="secondary">立即扫描一次</button>
+    <button id="errorBtn" class="secondary">查看最近错误</button>
   </div>
 
   <div class="card">
@@ -103,10 +105,17 @@ ADMIN_HTML = """
       outputEl.textContent = JSON.stringify(data, null, 2);
     }
 
+    async function fetchErrors() {
+      const resp = await fetch('/api/scan/errors?limit=100');
+      const data = await resp.json();
+      outputEl.textContent = JSON.stringify(data, null, 2);
+    }
+
     document.getElementById('addRowBtn').addEventListener('click', () => addRow());
     document.getElementById('submitBtn').addEventListener('click', submitImport);
     document.getElementById('statusBtn').addEventListener('click', fetchStatus);
     document.getElementById('scanBtn').addEventListener('click', scanOnce);
+    document.getElementById('errorBtn').addEventListener('click', fetchErrors);
 
     addRow('默认分组', '示例频道', 'https://example.com/live');
   </script>
@@ -132,6 +141,7 @@ class SchedulerState(BaseModel):
     source_count: int
     stream_count: int
     last_run_at: Optional[str]
+    last_error_count: int
 
 
 # 全局状态（内存存储）
@@ -139,13 +149,21 @@ source_configs: Dict[str, Dict[str, str]] = {}
 alive_streams: Dict[str, Dict[str, str]] = {}
 scan_interval_seconds = 300
 last_scan_at: Optional[datetime] = None
+last_scan_errors: List[str] = []
 state_lock = threading.Lock()
 stop_event = threading.Event()
 worker_thread: Optional[threading.Thread] = None
 
 
+def is_direct_stream_url(target_url: str) -> bool:
+    path = (urlparse(target_url).path or "").lower()
+    return any(path.endswith(ext) for ext in [".m3u8", ".flv", ".mpd", ".mp4", ".ts", ".m4s"])
+
+
 def extract_stream_urls(target_url: str):
     extracted_urls = set()  # 使用 set 去重
+    if is_direct_stream_url(target_url):
+        return [target_url]
 
     with sync_playwright() as p:
         # Docker Linux 环境下必需的启动参数，关闭沙盒和 GPU 加速
@@ -175,12 +193,12 @@ def extract_stream_urls(target_url: str):
         page.on("request", handle_request)
 
         try:
-            # 访问目标网页，wait_until="networkidle" 表示等待直到网络不再有大量活动
-            page.goto(target_url, timeout=30000, wait_until="networkidle")
-            # 额外等待 5 秒，确保动态加载的视频流请求已经发出
-            time.sleep(5)
+            # 直播页经常有长连接，networkidle 容易超时，这里改用 domcontentloaded
+            page.goto(target_url, timeout=45000, wait_until="domcontentloaded")
+            # 额外等待一段时间，确保动态加载的视频流请求已经发出
+            time.sleep(8)
         except Exception as e:
-            print(f"访问网页时发生错误: {e}")
+            print(f"访问网页时发生错误: {e}; target={target_url}")
         finally:
             browser.close()
 
@@ -219,15 +237,18 @@ def ffprobe_is_alive(stream_url: str, timeout_seconds: int = 8) -> bool:
 
 
 def run_scan_once():
-    global last_scan_at
+    global last_scan_at, last_scan_errors
 
     with state_lock:
         pages = dict(source_configs)
 
     fresh_alive: Dict[str, Dict[str, str]] = {}
+    errors: List[str] = []
 
     for page_url, source_meta in pages.items():
         stream_urls = extract_stream_urls(page_url)
+        if not stream_urls:
+            errors.append(f"未抓到流: {page_url}")
         for stream_url in stream_urls:
             if ffprobe_is_alive(stream_url):
                 fresh_alive[stream_url] = {
@@ -236,11 +257,14 @@ def run_scan_once():
                     "channel_name": source_meta.get("channel_name", "live"),
                     "last_ok": datetime.now(timezone.utc).isoformat(),
                 }
+            else:
+                errors.append(f"测活失败: {stream_url}")
 
     with state_lock:
         alive_streams.clear()
         alive_streams.update(fresh_alive)
         last_scan_at = datetime.now(timezone.utc)
+        last_scan_errors = errors
 
 
 def scheduler_loop():
@@ -344,7 +368,18 @@ def scheduler_status():
             source_count=len(source_configs),
             stream_count=len(alive_streams),
             last_run_at=last_scan_at.isoformat() if last_scan_at else None,
+            last_error_count=len(last_scan_errors),
         )
+
+
+@app.get("/api/scan/errors")
+def scan_errors(limit: int = 50):
+    with state_lock:
+        capped_limit = max(1, min(limit, 200))
+        return {
+            "last_error_count": len(last_scan_errors),
+            "errors": last_scan_errors[:capped_limit],
+        }
 
 
 @app.get("/m3u", response_class=PlainTextResponse)

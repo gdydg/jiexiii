@@ -6,6 +6,7 @@ import subprocess
 import threading
 import time
 import json
+import os
 from urllib import request
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
@@ -156,6 +157,69 @@ last_scan_errors: List[str] = []
 state_lock = threading.Lock()
 stop_event = threading.Event()
 worker_thread: Optional[threading.Thread] = None
+
+
+def start_scheduler_if_needed():
+    global worker_thread
+    if worker_thread is None or not worker_thread.is_alive():
+        stop_event.clear()
+        worker_thread = threading.Thread(target=scheduler_loop, daemon=True)
+        worker_thread.start()
+
+
+def load_sources_from_env() -> Dict[str, object]:
+    """
+    支持两种环境变量导入格式：
+    1) SOURCE_IMPORT_CONFIG_JSON='{"interval_seconds":1800,"sources":[{"group_name":"g","channel_name":"c","url":"https://..."}]}'
+    2) SOURCE_IMPORT_SOURCES 按行配置：group_name|channel_name|url
+       另配 AUTO_IMPORT_INTERVAL_SECONDS=1800
+    """
+    raw_json = os.getenv("SOURCE_IMPORT_CONFIG_JSON", "").strip()
+    raw_lines = os.getenv("SOURCE_IMPORT_SOURCES", "").strip()
+    interval_from_env = os.getenv("AUTO_IMPORT_INTERVAL_SECONDS", "").strip()
+    interval = 300
+    if interval_from_env.isdigit():
+        interval = max(30, min(int(interval_from_env), 86400))
+
+    configs: Dict[str, Dict[str, str]] = {}
+
+    if raw_json:
+        try:
+            payload = json.loads(raw_json)
+            if isinstance(payload, dict):
+                interval = int(payload.get("interval_seconds", interval))
+                interval = max(30, min(interval, 86400))
+                for item in payload.get("sources", []) or []:
+                    if not isinstance(item, dict):
+                        continue
+                    url = str(item.get("url", "")).strip()
+                    group_name = str(item.get("group_name", "")).strip()
+                    channel_name = str(item.get("channel_name", "")).strip()
+                    if url and group_name and channel_name:
+                        configs[url] = {
+                            "group_name": group_name,
+                            "channel_name": channel_name,
+                        }
+        except Exception as e:
+            print(f"SOURCE_IMPORT_CONFIG_JSON 解析失败: {e}")
+
+    if raw_lines:
+        for line in raw_lines.splitlines():
+            row = line.strip()
+            if not row or row.startswith("#"):
+                continue
+            parts = [p.strip() for p in row.split("|", 2)]
+            if len(parts) != 3:
+                print(f"忽略无效 SOURCE_IMPORT_SOURCES 行: {row}")
+                continue
+            group_name, channel_name, url = parts
+            if group_name and channel_name and url:
+                configs[url] = {
+                    "group_name": group_name,
+                    "channel_name": channel_name,
+                }
+
+    return {"interval_seconds": interval, "sources": configs}
 
 
 def is_direct_stream_url(target_url: str) -> bool:
@@ -381,7 +445,7 @@ def get_urls(url: str):
 
 @app.post("/api/sources/import")
 def import_sources(payload: ImportSourcesRequest):
-    global scan_interval_seconds, worker_thread
+    global scan_interval_seconds
 
     with state_lock:
         source_configs.clear()
@@ -393,10 +457,7 @@ def import_sources(payload: ImportSourcesRequest):
         scan_interval_seconds = payload.interval_seconds
 
     # 懒启动调度线程
-    if worker_thread is None or not worker_thread.is_alive():
-        stop_event.clear()
-        worker_thread = threading.Thread(target=scheduler_loop, daemon=True)
-        worker_thread.start()
+    start_scheduler_if_needed()
 
     return {
         "message": "已导入来源并启动定时抓取",
@@ -479,3 +540,20 @@ def shutdown_event():
     stop_event.set()
     if worker_thread and worker_thread.is_alive():
         worker_thread.join(timeout=2)
+
+
+@app.on_event("startup")
+def startup_event():
+    global scan_interval_seconds
+    loaded = load_sources_from_env()
+    env_sources = loaded.get("sources", {})
+    if not isinstance(env_sources, dict) or not env_sources:
+        return
+
+    with state_lock:
+        source_configs.clear()
+        source_configs.update(env_sources)
+        scan_interval_seconds = int(loaded.get("interval_seconds", 300))
+
+    start_scheduler_if_needed()
+    print(f"已从环境变量导入 {len(source_configs)} 条来源，抓取间隔={scan_interval_seconds}s")

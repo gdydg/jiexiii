@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from pydantic import BaseModel, Field, HttpUrl
 from playwright.sync_api import sync_playwright
@@ -181,8 +181,16 @@ def extract_bilibili_stream_urls(target_url: str) -> List[str]:
         room_id = qs_room_id
 
     try:
+        common_headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Referer": target_url,
+            "Origin": "https://live.bilibili.com",
+            "Accept": "application/json, text/plain, */*",
+        }
+
         room_init_url = f"https://api.live.bilibili.com/room/v1/Room/room_init?id={room_id}"
-        with request.urlopen(room_init_url, timeout=10) as resp:
+        room_init_req = request.Request(room_init_url, headers=common_headers)
+        with request.urlopen(room_init_req, timeout=10) as resp:
             room_init = json.loads(resp.read().decode("utf-8", errors="ignore"))
 
         real_room_id = str(room_init.get("data", {}).get("room_id", room_id))
@@ -190,7 +198,8 @@ def extract_bilibili_stream_urls(target_url: str) -> List[str]:
             "https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo"
             f"?room_id={real_room_id}&protocol=0,1&format=0,2&codec=0,1&qn=10000&platform=web&ptype=8"
         )
-        with request.urlopen(play_info_url, timeout=10) as resp:
+        play_info_req = request.Request(play_info_url, headers=common_headers)
+        with request.urlopen(play_info_req, timeout=10) as resp:
             payload = json.loads(resp.read().decode("utf-8", errors="ignore"))
 
         playurl = payload.get("data", {}).get("playurl_info", {}).get("playurl", {})
@@ -339,6 +348,11 @@ def scheduler_loop():
 @app.get("/")
 def health_check():
     return {"status": "ok", "message": "Playwright 爬虫服务运行正常"}
+
+
+@app.get("/favicon.ico")
+def favicon():
+    return Response(status_code=204)
 
 
 @app.get("/admin", response_class=HTMLResponse)

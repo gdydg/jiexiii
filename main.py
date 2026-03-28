@@ -5,9 +5,11 @@ from playwright.sync_api import sync_playwright
 import subprocess
 import threading
 import time
+import json
+from urllib import request
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 app = FastAPI()
 
@@ -160,10 +162,63 @@ def is_direct_stream_url(target_url: str) -> bool:
     return any(path.endswith(ext) for ext in [".m3u8", ".flv", ".mpd", ".mp4", ".ts", ".m4s"])
 
 
+def extract_bilibili_stream_urls(target_url: str) -> List[str]:
+    """
+    通过 Bilibili 公开接口获取直播流，避免页面抓取超时或反爬导致拿不到流。
+    """
+    parsed = urlparse(target_url)
+    host = (parsed.netloc or "").lower()
+    if "live.bilibili.com" not in host:
+        return []
+
+    room_path = (parsed.path or "").strip("/")
+    if room_path.isdigit():
+        room_id = room_path
+    else:
+        qs_room_id = parse_qs(parsed.query).get("room_id", [""])[0]
+        if not qs_room_id.isdigit():
+            return []
+        room_id = qs_room_id
+
+    try:
+        room_init_url = f"https://api.live.bilibili.com/room/v1/Room/room_init?id={room_id}"
+        with request.urlopen(room_init_url, timeout=10) as resp:
+            room_init = json.loads(resp.read().decode("utf-8", errors="ignore"))
+
+        real_room_id = str(room_init.get("data", {}).get("room_id", room_id))
+        play_info_url = (
+            "https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo"
+            f"?room_id={real_room_id}&protocol=0,1&format=0,2&codec=0,1&qn=10000&platform=web&ptype=8"
+        )
+        with request.urlopen(play_info_url, timeout=10) as resp:
+            payload = json.loads(resp.read().decode("utf-8", errors="ignore"))
+
+        playurl = payload.get("data", {}).get("playurl_info", {}).get("playurl", {})
+        streams = playurl.get("stream", []) or []
+        urls = set()
+        for stream in streams:
+            for fmt in stream.get("format", []) or []:
+                for codec in fmt.get("codec", []) or []:
+                    base_url = codec.get("base_url", "")
+                    for info in codec.get("url_info", []) or []:
+                        host_url = info.get("host", "")
+                        extra = info.get("extra", "")
+                        if host_url and base_url:
+                            urls.add(f"{host_url}{base_url}{extra}")
+        return list(urls)
+    except Exception as e:
+        print(f"Bilibili API 抓流失败: {e}; target={target_url}")
+        return []
+
+
 def extract_stream_urls(target_url: str):
     extracted_urls = set()  # 使用 set 去重
     if is_direct_stream_url(target_url):
         return [target_url]
+
+    bilibili_urls = extract_bilibili_stream_urls(target_url)
+    if bilibili_urls:
+        return bilibili_urls
 
     with sync_playwright() as p:
         # Docker Linux 环境下必需的启动参数，关闭沙盒和 GPU 加速

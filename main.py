@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse
 from pydantic import BaseModel, Field, HttpUrl
 from playwright.sync_api import sync_playwright
 import subprocess
@@ -9,6 +9,110 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 app = FastAPI()
+
+ADMIN_HTML = """
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>直播源抓取管理台</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; max-width: 960px; margin: 24px auto; padding: 0 16px; }
+    h1 { margin-bottom: 8px; }
+    .hint { color: #555; margin-bottom: 16px; }
+    .card { border: 1px solid #ddd; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+    .row { display: grid; grid-template-columns: 1fr 1fr 2fr auto; gap: 8px; margin-bottom: 8px; }
+    input { padding: 8px; border: 1px solid #bbb; border-radius: 6px; }
+    button { padding: 8px 12px; border: none; border-radius: 6px; cursor: pointer; background: #2563eb; color: white; }
+    button.secondary { background: #334155; }
+    button.danger { background: #dc2626; }
+    pre { background: #0b1020; color: #c6f6d5; padding: 12px; border-radius: 8px; overflow: auto; }
+  </style>
+</head>
+<body>
+  <h1>直播源抓取管理台</h1>
+  <div class="hint">在线录入：分组名、频道名、待抓取链接，然后提交到 /api/sources/import。</div>
+
+  <div class="card">
+    <label>抓取间隔(秒)：<input id="interval" type="number" value="300" min="30" max="86400" /></label>
+    <div id="rows"></div>
+    <button id="addRowBtn" class="secondary">+ 增加一行</button>
+    <button id="submitBtn">提交导入</button>
+    <button id="scanBtn" class="secondary">立即扫描一次</button>
+  </div>
+
+  <div class="card">
+    <h3>状态</h3>
+    <button id="statusBtn" class="secondary">刷新状态</button>
+    <pre id="output">等待操作...</pre>
+  </div>
+
+  <script>
+    const rowsEl = document.getElementById('rows');
+    const outputEl = document.getElementById('output');
+
+    function addRow(group = '', channel = '', url = '') {
+      const row = document.createElement('div');
+      row.className = 'row';
+      row.innerHTML = `
+        <input placeholder="分组名" value="${group}" />
+        <input placeholder="频道名" value="${channel}" />
+        <input placeholder="待抓取链接 (https://...)" value="${url}" />
+        <button class="danger">删除</button>
+      `;
+      row.querySelector('button').addEventListener('click', () => row.remove());
+      rowsEl.appendChild(row);
+    }
+
+    function collectSources() {
+      const rows = Array.from(rowsEl.querySelectorAll('.row'));
+      return rows.map(r => {
+        const [group, channel, url] = r.querySelectorAll('input');
+        return {
+          group_name: group.value.trim(),
+          channel_name: channel.value.trim(),
+          url: url.value.trim(),
+        };
+      }).filter(s => s.group_name && s.channel_name && s.url);
+    }
+
+    async function submitImport() {
+      const payload = {
+        interval_seconds: Number(document.getElementById('interval').value || 300),
+        sources: collectSources(),
+      };
+      const resp = await fetch('/api/sources/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = await resp.json();
+      outputEl.textContent = JSON.stringify(data, null, 2);
+    }
+
+    async function fetchStatus() {
+      const resp = await fetch('/api/scheduler/status');
+      const data = await resp.json();
+      outputEl.textContent = JSON.stringify(data, null, 2);
+    }
+
+    async function scanOnce() {
+      const resp = await fetch('/api/scan/once', { method: 'POST' });
+      const data = await resp.json();
+      outputEl.textContent = JSON.stringify(data, null, 2);
+    }
+
+    document.getElementById('addRowBtn').addEventListener('click', () => addRow());
+    document.getElementById('submitBtn').addEventListener('click', submitImport);
+    document.getElementById('statusBtn').addEventListener('click', fetchStatus);
+    document.getElementById('scanBtn').addEventListener('click', scanOnce);
+
+    addRow('默认分组', '示例频道', 'https://example.com/live');
+  </script>
+</body>
+</html>
+"""
 
 
 class SourceInput(BaseModel):
@@ -158,6 +262,11 @@ def health_check():
     return {"status": "ok", "message": "Playwright 爬虫服务运行正常"}
 
 
+@app.get("/admin", response_class=HTMLResponse)
+def admin_page():
+    return ADMIN_HTML
+
+
 # 核心抓取接口（单次）
 @app.get("/api/get_urls")
 def get_urls(url: str):
@@ -195,6 +304,23 @@ def import_sources(payload: ImportSourcesRequest):
         "message": "已导入来源并启动定时抓取",
         "source_count": len(source_configs),
         "interval_seconds": scan_interval_seconds,
+    }
+
+
+@app.get("/api/sources/import")
+def import_sources_help():
+    return {
+        "message": "该接口仅支持 POST 导入。请使用 JSON 请求体提交 sources 和 interval_seconds。",
+        "example": {
+            "sources": [
+                {
+                    "group_name": "央视",
+                    "channel_name": "CCTV-1",
+                    "url": "https://example.com/live/cctv1"
+                }
+            ],
+            "interval_seconds": 300
+        }
     }
 
 

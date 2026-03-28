@@ -150,6 +150,7 @@ class SchedulerState(BaseModel):
 source_configs: Dict[str, Dict[str, str]] = {}
 alive_streams: Dict[str, Dict[str, str]] = {}
 scan_interval_seconds = 300
+max_streams_per_source = 3
 last_scan_at: Optional[datetime] = None
 last_scan_errors: List[str] = []
 state_lock = threading.Lock()
@@ -313,7 +314,10 @@ def run_scan_once():
         stream_urls = extract_stream_urls(page_url)
         if not stream_urls:
             errors.append(f"未抓到流: {page_url}")
+        kept_for_source = 0
         for stream_url in stream_urls:
+            if kept_for_source >= max_streams_per_source:
+                break
             if ffprobe_is_alive(stream_url):
                 fresh_alive[stream_url] = {
                     "source_page": page_url,
@@ -321,6 +325,7 @@ def run_scan_once():
                     "channel_name": source_meta.get("channel_name", "live"),
                     "last_ok": datetime.now(timezone.utc).isoformat(),
                 }
+                kept_for_source += 1
             else:
                 errors.append(f"测活失败: {stream_url}")
 
